@@ -1,550 +1,856 @@
-# This program is free software; you can redistribute it and/or modify
+# Copyright (C) 2021 'BD3D DIGITAL DESIGN, SLU'
+#
+# This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; either version 3 of the License, or
+# the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 #
-# This program is distributed in the hope that it will be useful, but
-# WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTIBILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-# General Public License for more details.
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
 #
 # You should have received a copy of the GNU General Public License
-# along with this program. If not, see <http://www.gnu.org/licenses/>.
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
 
 bl_info = {
-    "name": "Bonegeotoolkit",
-    "author": "SFY",
-    "description": "",
-    "blender": (2, 80, 0),
-    "version": (0, 0, 1),
-    "location": "",
+    "name": "'Python Api' for Geometry-Node",
+    "author": "BD3D",
+    "description": "This plugin add an extra node for Geometry-Node that will evaluate python data, use 'Auto Evaluation' to automatically re-evaluate the python eval() snippets",
+    "blender": (3, 0, 0),
+    "version": (1, 0, 0),
+    "location": "Node Editor > Geometry Node > Add Menu > Extra",
     "warning": "",
-    "category": "Generic",
+    "tracker_url": "https://devtalk.blender.org/t/extra-nodes-for-geometrynodes/20942",
+    "category": "Node",
 }
+
+"""
+
+# About creating GeometryNodeCustomGroup:
+
+>Here are the possibilities: 
+    - you can either create a custom interface that interact with a nodegroup
+    - or create simple input node, this plugin is only creating input values. all boiler plate below is dedicated to output sockets. 
+
+> if you want to process data, forget about it:
+   - currently there's no way to get the value out of a socket, not sure how they could translate field to python.
+   - writing simple output value is possible, forget about fields tho.    
+
+> update management is not ideal
+   - socket_value_update() function should send us signal when a socket value is being updated, the api is dead for now
+   - to update, rely on handlers or msgbus ( https://docs.blender.org/api/blender2.8/bpy.app.handlers.html?highlight=handler#module-bpy.app.handlers )
+
+> socket.type is read only, everything is hardcoded in operators
+   - to change socket type, we forced to use operator `bpy.ops.node.tree_socket_change_type(in_out='IN', socket_type='')` + context 'override'. this is far from ideal. 
+     this means that changing socket type outside the node editor context is not possible. 
+
+> in order to change the default value of an output, nodegroup.outputs[n].default value won't work use, api is confusing, it is done via the nodegroup.nodes instead: 
+    - nodegroup.nodes["Group Output"].inputs[n].default_value  ->see boiler plate functions i wrote below
+
+> Warning `node_groups[x].outputs.new("NodeSocketBool","test")` is tricky, type need to be exact, no warning upon error, will just return none
+
+
+About this script:
+
+>You will note that there is an extra attention to detail in order to not register handlers twice
+
+>You will note that there is an extra attention in the extension of the Add menu with this new 'Extra' category. 
+   In, my opinion all plugin nodes should be in this "Extra" menu. 
+   Feel free to reuse the menu registration snippets so all custom node makers can share the 'Extra' menu without confilcts.  
+
+"""
+
 import bpy
-import math
-from mathutils import Euler, Vector
-from bpy.types import GeometryNode
 
 
-class BoneGeoToolkitBoneSocket(bpy.types.NodeSocket):
-    """示例自定义插槽类型"""
-
-    bl_idname = "BoneSocketType"
-    bl_label = "Bone Socket"
-    bl_color = (0.32, 1, 0.48, 1.0)  # 插槽颜色
-
-    # 定义多个属性
-    armature: bpy.props.PointerProperty(name="Armature", type=bpy.types.Object)
-    bone_name: bpy.props.StringProperty(name="Bone Name", default="")
-
-    def draw(self, context, layout, node, text):
-        """绘制插槽"""
-        if self.is_output or self.is_linked:
-            layout.label(text=text)
-        else:
-            col = layout.column(align=True)
-            # 添加第一个属性到列中
-            col.prop(self, "armature", text="Armature", icon="ARMATURE_DATA")
-            # 添加第二个属性到列中
-            col.prop(self, "bone_name", text="Bone Name", icon="BONE_DATA")
-
-    def draw_color(self, context, node):
-        """定义插槽颜色"""
-        return self.bl_color
+##################################################
+# BOILER PLATE
+##################################################
 
 
-class test_node(bpy.types.Node):
-    bl_idname = "CustomNodeTypetest_node"
-    bl_label = "Test Node"
-    bl_icon = "SETTINGS"
+major, minor, patch = bpy.app.version
 
-    test_float: bpy.props.FloatProperty(name="Test Float", default=1.0, update=lambda self, context: self.update_sockets())
-    test_int: bpy.props.IntProperty(name="Test Int", default=1)
-    test_bool: bpy.props.BoolProperty(name="Test Bool", default=True)
-    test_string: bpy.props.StringProperty(name="Test String", default="Hello World")
-    test_enum: bpy.props.EnumProperty(
-        name="Test Enum",
-        items=[
-            ("ITEM1", "Item 1", "Item 1 description"),
-            ("ITEM2", "Item 2", "Item 2 description"),
-            ("ITEM3", "Item 3", "Item 3 description"),
-        ],
-        default="ITEM1",
+
+def get_socket_value(ng, idx):
+    return ng.nodes["Group Output"].inputs[idx].default_value
+
+
+def set_socket_value(ng, idx, value=None):
+    ng.nodes["Group Output"].inputs[idx].default_value = value
+    return ng.nodes["Group Output"].inputs[idx].default_value
+
+
+def set_socket_label(ng, idx, label=None):
+    if major < 4:
+        ng.outputs[idx].name = str(label)
+    else:
+        ng.interface.items_tree[idx].name = str(label)
+    return None
+
+
+def get_socket_type(ng, idx):
+    if major < 4:
+        return ng.outputs[idx].type
+    else:
+        return ng.interface.items_tree[idx].socket_type
+
+
+def set_socket_type(ng, idx, socket_type="NodeSocketFloat"):
+    """set socket type via bpy.ops.node.tree_socket_change_type() with manual override, context MUST be the geometry node editor"""
+
+    snode = bpy.context.space_data
+    if snode is None:
+        return None
+
+    # forced to do a ugly override like this... eww
+    restore_override = {"node_tree": snode.node_tree, "pin": snode.pin}
+    snode.pin = True
+    snode.node_tree = ng
+    # ng.active_output = idx
+    # bpy.data.node_groups['Geometry Nodes'].interface.active_index
+    # ng.interface.active_index = idx
+    ng.interface.items_tree[idx].socket_type = socket_type
+    # bpy.ops.node.tree_socket_change_type(in_out="OUT", socket_type=socket_type)  # operator override is best, but which element do we need to override, not sure what the cpp operator need..
+
+    # then restore... all this will may some signal to depsgraph
+    for api, obj in restore_override.items():
+        setattr(snode, api, obj)
+
+    return None
+
+
+def create_socket(ng, socket_type="NodeSocketFloat", socket_name="Value"):
+    if major < 4:
+        socket = ng.outputs.new(socket_type, socket_name)
+    else:
+        socket = ng.interface.new_socket(name=socket_name, socket_type=socket_type, in_out="OUTPUT")
+    return socket
+
+
+def remove_socket(ng, idx):
+    todel = ng.interface.items_tree[idx]
+    ng.interface.remove(todel)
+    # todel = ng.outputs[idx]
+    # ng.outputs.remove(todel)
+    return None
+
+
+def create_new_nodegroup(name, sockets={}):
+    """create new nodegroup with outputs from given dict {"name":"type",}, make sure given type are correct"""
+
+    ng = bpy.data.node_groups.new(name=name, type="GeometryNodeTree")
+    in_node = ng.nodes.new("NodeGroupInput")
+    in_node.location.x -= 200
+    out_node = ng.nodes.new("NodeGroupOutput")
+    out_node.location.x += 200
+
+    for socket_name, socket_type in sockets.items():
+        create_socket(ng, socket_type=socket_type, socket_name=socket_name)
+
+    return ng
+
+
+# def import_nodegroup(groupname, source_blend="extra_node_python_api.blend",):
+#     """import an existing nodegroup"""
+
+#     import os
+
+#     python_path = os.path.dirname(os.path.realpath(__file__))
+#     lib_file = os.path.join(python_path,source_blend)
+
+#     with bpy.data.libraries.load(lib_file,link=False) as (data_from,data_to):
+#        data_to.node_groups.append(groupname)
+#     group = bpy.data.node_groups[groupname]
+#     group.use_fake_user = True
+
+#     return group
+
+
+##################################################
+# CUSTOM NODE
+##################################################
+
+
+# convenience import, needed for string evaluation
+from mathutils import *
+from math import *
+
+
+class EXTRANODEPYTHONAPI_NG_python_api(bpy.types.GeometryNodeCustomGroup):
+
+    bl_idname = "GeometryNodePythonApi"
+    bl_label = "Python Api"
+
+    error: bpy.props.BoolProperty(
+        default=False,
     )
-    object: bpy.props.PointerProperty(name="Object", type=bpy.types.Object)
+    socket_type: bpy.props.StringProperty(default="NodeSocketBool")
+    debug_update_counter: bpy.props.IntProperty()  # visual aid debug
 
-    def init(self, context):
-        self.outputs.new("NodeSocketFloat", "Float Output")
-        self.outputs.new("NodeSocketInt", "Int Output")
-        self.outputs.new("NodeSocketBool", "Bool Output")
-        self.outputs.new("NodeSocketString", "String Output")
-        self.inputs.new("NodeSocketFloat", "Float Input")
-        self.inputs.new("NodeSocketInt", "整数输入11")
+    def api_str_update(self, context):
+        """update and implicit conversion when human is writing and press enter"""
+        self.evaluate_api(implicit_conversion=True)
+        return None
 
-    def draw_buttons(self, context, layout):
-        layout.operator("mynode.test_operator", text="Test Button")
-        layout.prop(self, "test_float")
-        layout.prop(self, "test_int")
-        layout.prop(self, "test_bool")
-        layout.prop(self, "test_string")
-        layout.prop(self, "test_enum")
-        layout.prop(self, "object")
+    api_str: bpy.props.StringProperty(
+        update=api_str_update,
+    )
 
-    def draw_label(self):
-        return "Test Node"
+    @classmethod
+    def poll(cls, context):  # mandatory with geonode
+        return True
 
-    def update_sockets(self):
-        print("sockets updated")
+    def init(
+        self,
+        context,
+    ):
+        """this fct run when appending the node for the first time"""
 
-    def update(self):
-        output_sockets = self.outputs.get("Float Output")
-        if output_sockets is not None and output_sockets.is_linked:
-            for link in output_sockets.links:
-                if link.is_valid:
-                    socket = link.to_socket
-                    print(socket.type)
-                    if socket.type == "VALUE":
-                        socket.default_value = self.test_float
-                    elif socket.type == "INT":
-                        socket.default_value = int(self.test_float)
-                    elif socket.type == "BOOLEAN":
-                        socket.default_value = self.test_float >= 1
+        name = f".{self.bl_idname}"
+        if not name in bpy.data.node_groups.keys():
+            ng = create_new_nodegroup(
+                name,
+                sockets={"Waiting for Input": "NodeSocketFloat", "Error": "NodeSocketBool"},
+            )
+        else:
+            ng = bpy.data.node_groups[name].copy()
 
+        self.node_tree = ng
+        self.label = self.bl_label
+        self.width = 250
 
-class GeometryNodeCustom(GeometryNode):
-    bl_idname = "GeometryNodeCustom"
-    bl_label = "Custom Geometry Node"
+        # mark an update signal so handler fct do not need to loop every single nodegroups
+        bpy.context.space_data.node_tree["extra_node_python_api_update_needed"] = True
 
-    def init(self, context):
-        # 输入插槽
-        self.inputs.new("NodeSocketGeometry", "Geometry")
-        # 输出插槽
-        self.outputs.new("NodeSocketGeometry", "Modified Geometry")
+        return None
 
-    def process(self, input_data):
-        """核心逻辑：处理输入数据并返回输出数据"""
-        input_geometry = input_data["Geometry"]
-
-        # 示例操作：对输入几何体进行变换（如平移）
-        if input_geometry is not None:
-            # 获取几何体数据（例如网格）
-            mesh = input_geometry.data
-
-            # 修改顶点位置（示例：沿 X 轴移动）
-            for vertex in mesh.vertices:
-                vertex.co.x += 1.0
-
-            # 返回处理后的几何体
-            return {"Modified Geometry": input_geometry}
-
-        # 若输入为空，直接传递 None
-        return {"Modified Geometry": None}
-
-
-class BoneGeoToolkit_Bone_input_node(bpy.types.Node):
-    bl_idname = "BoneInputNode"
-    bl_label = "Bone Input Node"
-    bl_icon = "BLANK1"
-
-    def init(self, context):
-        self.inputs.new("NodeSocketObject", "Object")
-        self.inputs.new("NodeSocketString", "Bone Name")
-        self.outputs.new("BoneSocketType", "Bone")
-
-    def draw_buttons(self, context, layout):
-        # # 检查值是否变化
-        # if self.inputs[0].default_value != getattr(self, "_last_value", 0):
-        #     print("输入值变化！")
-        pass
-
-    def draw_label(self):
-        return "Bone Input Node"
+    def copy(
+        self,
+        node,
+    ):
+        """fct run when dupplicating the node"""
+        self.node_tree = node.node_tree.copy()
+        return None
 
     def update(self):
-        # print("Bone Input Node update")
-        output_sockets = self.outputs.get("Bone")
-        if output_sockets is not None and output_sockets.is_linked:
-            for link in output_sockets.links:
-                if link.is_valid:
-                    socket = link.to_socket
-                    socket.armature = self.inputs[0].default_value
-                    socket.bone_name = self.inputs[1].default_value
+        """generic update function"""
 
+        self.evaluate_api()
 
-class BoneGeoToolkit_BoneInfoNode(bpy.types.Node):
-    bl_idname = "CustomBoneInfoNode"
-    bl_label = "Custom Bone Info Node"
-    bl_icon = "BLANK1"
-    bl_width_default = 150
-    bl_height_default = 100
+        self.debug_update_counter += 1
+        return None
 
-    obj: bpy.props.PointerProperty(name="Object", type=bpy.types.Object)
-    bone_name: bpy.props.StringProperty(name="Bone Name", default="")
+    def evaluate_api(self, implicit_conversion=False):
+        """function that will evaluate the pointer and assign value to output node"""
 
-    def init(self, context):
-        self.outputs.new("NodeSocketVector", "Head Location")
-        self.outputs.new("NodeSocketVector", "Tail Location")
-        self.outputs.new("NodeSocketVector", "Rotation")
-        self.outputs.new("NodeSocketVector", "Scale")
-        # self.inputs.new("NodeSocketObject", "Object")
-        # self.inputs.new("NodeSocketString", "Bone Name")
-        self.inputs.new("BoneSocketType", "Bone")
+        ng = self.node_tree
 
-    def draw_buttons(self, context, layout):
-        # layout.prop(self, "obj")
-        # layout.prop(self, "bone_name")
-        pass
+        # check if string is empty first, perhaps user didn't input anything yet
+        if self.api_str == "":
 
-    def draw_label(self):
-        return "Bone Info Node"
+            set_socket_value(
+                ng,
+                1,
+                value=True,
+            )
+            set_socket_label(
+                ng,
+                0,
+                label="Waiting for Input",
+            )
 
-    def update(self):
+            return None
 
-        # self.obj = self.inputs["Object"].default_value
-        # self.bone_name = self.inputs["Bone Name"].default_value
+        # catch any exception, and report error to node
+        try:
+            # convenience variable
+            D = bpy.data
+            C = context = bpy.context
+            scene = context.scene
 
-        self.obj = self.inputs["Bone"].armature
-        self.bone_name = self.inputs["Bone"].bone_name
-        if not self.obj:
-            return
-        if not self.obj.pose or self.bone_name is None:
-            return
-        if self.bone_name not in self.obj.pose.bones:
-            return
-        output_sockets = self.outputs.get("Head Location")
-        if output_sockets is not None and output_sockets.is_linked:
-            for link in output_sockets.links:
-                if link.is_valid:
-                    socket = link.to_socket
-                    bone = self.obj.pose.bones[self.bone_name]
-                    socket.default_value = bone.head
-        output_sockets = self.outputs.get("Tail Location")
-        if output_sockets is not None and output_sockets.is_linked:
-            for link in output_sockets.links:
-                if link.is_valid:
-                    socket = link.to_socket
-                    bone = self.obj.pose.bones[self.bone_name]
-                    socket.default_value = bone.tail
+            # convenience execution
+            convenience_exec3 = bpy.context.preferences.addons["extra_node_python_api"].preferences.convenience_exec3
+            if convenience_exec3 != "":
+                exec(bpy.context.preferences.addons["extra_node_python_api"].preferences.convenience_exec3)
 
-        output_sockets = self.outputs.get("Rotation")
-        if output_sockets is not None and output_sockets.is_linked:
-            for link in output_sockets.links:
-                if link.is_valid:
-                    socket = link.to_socket
-                    bone = self.obj.pose.bones[self.bone_name]
-                    euler = bone.matrix.to_quaternion().to_euler("XYZ")
-                    euler_list = [euler.x, euler.y, euler.z]
-                    adjusted_euler_list = [euler_list[0] - math.pi / 2, euler_list[1], euler_list[2]]
-                    socket.default_value = Euler(adjusted_euler_list, "XYZ")
-        output_sockets = self.outputs.get("Scale")
-        if output_sockets is not None and output_sockets.is_linked:
-            for link in output_sockets.links:
-                if link.is_valid:
-                    socket = link.to_socket
-                    bone = self.obj.pose.bones[self.bone_name]
-                    socket.default_value = bone.scale.copy()
+            # evaluate
+            value = eval(self.api_str)
 
+            # translate to list when possible
+            if type(value) in (
+                Vector,
+                Euler,
+                bpy.types.bpy_prop_array,
+                tuple,
+            ):
+                value = list(value)
 
-class BoneGeoToolkit_update_handlers_manager(bpy.types.Node):
-    bl_idname = "BoneGeoToolkit_update_handlers_manager"
-    bl_label = "update handlers manager"
-    bl_icon = "TOOL_SETTINGS"
-    bl_width_default = 300
-    bl_height_default = 100
+            # get the value type
+            type_val = type(value)
 
-    def init(self, context):
-        pass
+            # evaluate as bool?
+            if type_val is bool:
 
-    def draw_buttons(self, context, layout):
-        layout.operator(updata_test_operator.bl_idname, text="更新节点数据")
+                if implicit_conversion and (get_socket_type(ng, 0) != "BOOLEAN"):
+                    set_socket_type(ng, 0, socket_type="NodeSocketBool")
+                    self.socket_type = "NodeSocketBool"
+                v = set_socket_value(
+                    ng,
+                    0,
+                    value=value,
+                )
+                set_socket_label(
+                    ng,
+                    0,
+                    label=v,
+                )
+
+            # evaluate as int?
+            elif type_val is int:
+
+                if implicit_conversion and (get_socket_type(ng, 0) != "INT"):
+                    set_socket_type(ng, 0, socket_type="NodeSocketInt")
+                    self.socket_type = "NodeSocketInt"
+                v = set_socket_value(
+                    ng,
+                    0,
+                    value=value,
+                )
+                set_socket_label(
+                    ng,
+                    0,
+                    label=v,
+                )
+
+            # float?
+            elif type_val is float:
+
+                if implicit_conversion and (get_socket_type(ng, 0) != "VALUE"):
+                    set_socket_type(ng, 0, socket_type="NodeSocketFloat")
+                    self.socket_type = "NodeSocketFloat"
+                v = set_socket_value(
+                    ng,
+                    0,
+                    value=value,
+                )
+                set_socket_label(
+                    ng,
+                    0,
+                    label=round(v, 4),
+                )
+
+            # vector/color?
+            elif type_val is list:
+
+                # evaluate as vector?
+                if len(value) == 3:
+
+                    if implicit_conversion and (get_socket_type(ng, 0) != "VECTOR"):
+                        set_socket_type(ng, 0, socket_type="NodeSocketVector")
+                        self.socket_type = "NodeSocketVector"
+                    v = set_socket_value(
+                        ng,
+                        0,
+                        value=value,
+                    )
+                    set_socket_label(
+                        ng,
+                        0,
+                        label=[round(n, 4) for n in v],
+                    )
+
+                # evaluate as color?
+                elif len(value) == 4:
+
+                    if implicit_conversion and (get_socket_type(ng, 0) != "RGBA"):
+                        set_socket_type(ng, 0, socket_type="NodeSocketColor")
+                        self.socket_type = "NodeSocketColor"
+                    v = set_socket_value(
+                        ng,
+                        0,
+                        value=value,
+                    )
+                    set_socket_label(
+                        ng,
+                        0,
+                        label=[round(n, 4) for n in v],
+                    )
+
+                # only vec3 and vec4 are supported
+                else:
+                    self.error = True
+                    raise Exception(f"TypeError: 'List{len(value)}' not supported")
+
+            # string?
+            elif type_val is str:
+
+                if implicit_conversion and (get_socket_type(ng, 0) != "STRING"):
+                    set_socket_type(ng, 0, socket_type="NodeSocketString")
+                    self.socket_type = "NodeSocketString"
+                v = set_socket_value(
+                    ng,
+                    0,
+                    value=value,
+                )
+                set_socket_label(
+                    ng,
+                    0,
+                    label='"' + v + '"',
+                )
+
+            # object type?
+            elif type_val is bpy.types.Object:
+
+                if implicit_conversion and (get_socket_type(ng, 0) != "OBJECT"):
+                    set_socket_type(ng, 0, socket_type="NodeSocketObject")
+                    self.socket_type = "NodeSocketObject"
+                v = set_socket_value(
+                    ng,
+                    0,
+                    value=value,
+                )
+                set_socket_label(
+                    ng,
+                    0,
+                    label=f'D.objects["{v.name}"]',
+                )
+
+            # collection type?
+            elif type_val is bpy.types.Collection:
+
+                if implicit_conversion and (get_socket_type(ng, 0) != "COLLECTION"):
+                    set_socket_type(ng, 0, socket_type="NodeSocketCollection")
+                    self.socket_type = "NodeSocketCollection"
+                v = set_socket_value(
+                    ng,
+                    0,
+                    value=value,
+                )
+                set_socket_label(
+                    ng,
+                    0,
+                    label=f'D.collections["{v.name}"]',
+                )
+
+            # material type?
+            elif type_val is bpy.types.Material:
+
+                if implicit_conversion and (get_socket_type(ng, 0) != "MATERIAL"):
+                    set_socket_type(ng, 0, socket_type="NodeSocketMaterial")
+                    self.socket_type = "NodeSocketMaterial"
+                v = set_socket_value(
+                    ng,
+                    0,
+                    value=value,
+                )
+                set_socket_label(
+                    ng,
+                    0,
+                    label=f'D.materials["{v.name}"]',
+                )
+
+            # image type?
+            elif type_val is bpy.types.Image:
+
+                if implicit_conversion and (get_socket_type(ng, 0) != "IMAGE"):
+                    set_socket_type(ng, 0, socket_type="NodeSocketImage")
+                    self.socket_type = "NodeSocketImage"
+                v = set_socket_value(
+                    ng,
+                    0,
+                    value=value,
+                )
+                set_socket_label(
+                    ng,
+                    0,
+                    label=f'D.images["{v.name}"]',
+                )
+
+            # #texture type? well how about we have the sample texture node back ;-)
+            # elif (type_val is bpy.types.Texture): #-> well, annoying because it give us subtype, how to check if type given is a texture then? check parent class with python?
+            #
+            #     if implicit_conversion and (get_socket_type(ng,0)!="TEXTURE"):
+            #         set_socket_type(ng,0, socket_type="NodeSocketTexture")
+            #     v=set_socket_value(ng,0, value=value,)
+            #     set_socket_label(ng,0, label=f'D.textures["{value.name}"]',)
+
+            # unsusupported type
+            else:
+                self.error = True
+                raise Exception(f"TypeError: '{type_val.__name__.title()}' not supported")
+
+            # no error, then return False to error prop
+            set_socket_value(
+                ng,
+                1,
+                value=False,
+            )
+
+            self.error = False
+            return get_socket_value(ng, 0)
+
+        except Exception as e:
+
+            self.error = True
+            print(f"GeometryNodePythonApi >>> {e}")
+
+            set_socket_value(
+                ng,
+                1,
+                value=True,
+            )
+            set_socket_label(
+                ng,
+                0,
+                label=e,
+            )
+
+        return None
+
+    # def socket_value_update(self,context):
+    #    """dead api, revive me please?"""
+    #    return None
+
+    def draw_label(
+        self,
+    ):
+        """node label"""
+        return "Python Api"
+
+    def draw_buttons(
+        self,
+        context,
+        layout,
+    ):
+        """node interface drawing"""
+
+        ng = self.node_tree
+
         row = layout.row()
-        row.operator(add_depsgraph_update_pre_handler_operator.bl_idname, text="添加depsgraph_update_pre")
-        row.operator(remove_depsgraph_update_pre_handler_operator.bl_idname, text="移除depsgraph_update_pre")
-        row2 = layout.row()
-        row2.operator(add_depsgraph_update_post_handler_operator.bl_idname, text="添加depsgraph_update_post")
-        row2.operator(remove_depsgraph_update_post_handler_operator.bl_idname, text="移除depsgraph_update_post")
-        row3 = layout.row()
-        row3.operator(add_frame_change_pre_handler_operator.bl_idname, text="添加frame_change_pre")
-        row3.operator(remove_frame_change_pre_handler_operator.bl_idname, text="移除frame_change_pre")
-        row4 = layout.row()
-        row4.operator(add_frame_change_post_handler_operator.bl_idname, text="添加frame_change_post")
-        row4.operator(remove_frame_change_post_handler_operator.bl_idname, text="移除frame_change_post")
+        row.alert = self.error
+        row.prop(
+            self,
+            "api_str",
+            text="",
+        )
 
-    def draw_label(self):
-        return "Update Handlers Manager"
+        if bpy.context.preferences.addons["extra_node_python_api"].preferences.debug:
+            # if 1:
+            box = layout.column()
+            box.active = False
+            box.prop(self, "node_tree", text="")
+            box.prop(self, "debug_update_counter", text="update count")
 
-
-class BoneGeoToolkit_transform_bone_node(bpy.types.Node):
-    bl_idname = "TransformBoneNode"
-    bl_label = "Transform Bone Node"
-    bl_icon = "BLANK1"
-
-    def init(self, context):
-        self.inputs.new("NodeSocketGeometry", "Geometry Input")
-        self.outputs.new("NodeSocketGeometry", "Geometry Output")
-        self.inputs.new("BoneSocketType", "Bone")
-        self.inputs.new("NodeSocketVector", "Location")
-        self.inputs.new("NodeSocketVector", "Rotation")
-        scale_socket = self.inputs.new("NodeSocketVector", "Scale")
-        scale_socket.default_value = (1.0, 1.0, 1.0)  # 默认缩放为 1 倍
-        self.outputs.new("BoneSocketType", "Bone")
-        pass
-
-    def draw_buttons(self, context, layout):
-        pass
-
-    def draw_label(self):
-        return "Transform Bone Node"
-
-    def update(self):
-        # """当输入或输出发生变化时调用此方法"""
-        # # 获取输入插槽的几何数据
-        # input_socket = self.inputs["Geometry Input"]
-        # if input_socket.is_linked:
-        #     # 如果输入插槽已连接，获取连接的几何数据
-        #     input_geometry = input_socket.links[0].from_socket.default_value
-        #     # 设置输出插槽的几何数据
-        #     self.outputs["Geometry Output"].default_value = input_geometry
-        # else:
-        #     # 如果输入插槽未连接，可以设置一个默认值或清空输出
-        #     self.outputs["Geometry Output"].default_value = None
-
-        armature = self.inputs["Bone"].armature
-        bone_name = self.inputs["Bone"].bone_name
-        if not armature or not bone_name:
-            return
-        if bone_name not in armature.pose.bones:
-            return
-        bone = armature.pose.bones[bone_name]
-        location = self.inputs["Location"].default_value
-        rotation = self.inputs["Rotation"].default_value
-        scale = self.inputs["Scale"].default_value
-        bone.location = location
-        bone.rotation_euler = rotation
-        bone.scale = scale
-        output_sockets = self.outputs.get("Bone")
-        if output_sockets is not None and output_sockets.is_linked:
-            for link in output_sockets.links:
-                if link.is_valid:
-                    socket = link.to_socket
-                    socket.armature = armature
-                    socket.bone_name = bone_name
+        return None
 
 
-def BoneGeoToolkit_update_handler(scene):
-    # 在这里添加操作符的逻辑
-    for tree in bpy.data.node_groups:
-        for node in tree.nodes:
-            if isinstance(node, BoneGeoToolkit_BoneInfoNode):
-                # 手动调用节点的 update 方法
-                node.update()
-            if isinstance(node, BoneGeoToolkit_Bone_input_node):
-                node.update()
+##################################################
+# HANDLER UPDATE
+##################################################
 
 
-class updata_test_operator(bpy.types.Operator):
-    bl_idname = "mynode.updata_test_operator"
-    bl_label = "updata_test_operator"
-    bl_description = "updata_test_operator"
+@bpy.app.handlers.persistent
+def extra_node_python_api_depsgraph(scene, desp):  # used for Api node, if allowed!
+    """update on depsgraph change"""
+    if bpy.context.preferences.addons["extra_node_python_api"].preferences.debug:
+        print("extra_node_python_api: depsgraph signal")
 
-    def execute(self, context):
-        BoneGeoToolkit_update_handler(bpy.context.scene)
-        self.report({"INFO"}, "updata_test_operator executed!")
-        return {"FINISHED"}
+    # automatic update for Python Api only if allowed
+    if not bpy.context.preferences.addons["extra_node_python_api"].preferences.auto_evaluate_py:
+        return None
 
+    # search for nodes all over data and update
+    for n in [n for ng in bpy.data.node_groups if ("extra_node_python_api_update_needed" in ng) for n in ng.nodes if (n.bl_idname == "GeometryNodePythonApi")]:
+        n.update()
 
-class add_depsgraph_update_pre_handler_operator(bpy.types.Operator):
-    bl_idname = "mynode.add_depsgraph_update_pre_handler"
-    bl_label = "add_depsgraph_update_pre_handler"
-    bl_description = "add_depsgraph_update_pre_handler"
-
-    def execute(self, context):
-        target_handler = BoneGeoToolkit_update_handler
-        if not (target_handler in bpy.app.handlers.depsgraph_update_pre):
-            bpy.app.handlers.depsgraph_update_pre.append(target_handler)
-        self.report({"INFO"}, "添加depsgraph_update_pre")
-        return {"FINISHED"}
+    return None
 
 
-class remove_depsgraph_update_pre_handler_operator(bpy.types.Operator):
-    bl_idname = "mynode.remove_depsgraph_update_pre_handler"
-    bl_label = "remove_depsgraph_update_pre_handler"
-    bl_description = "remove_depsgraph_update_pre_handler"
+@bpy.app.handlers.persistent
+def extra_node_python_api_frame_pre(scene, desp):  # used for Volume and Api Node!
+    """update on frame change"""
+    if bpy.context.preferences.addons["extra_node_python_api"].preferences.debug:
+        print("extra_node_python_api: frame_pre signal")
 
-    def execute(self, context):
-        for handler in bpy.app.handlers.depsgraph_update_pre:
-            target_handler = BoneGeoToolkit_update_handler
-            if handler == target_handler:
-                bpy.app.handlers.depsgraph_update_pre.remove(target_handler)
-                self.report({"INFO"}, "已移除depsgraph_update_pre")
-            else:
-                self.report({"INFO"}, "不存在depsgraph_update_pre")
-        return {"FINISHED"}
+    # automatic update for Python Api only if allowed
+    if not bpy.context.preferences.addons["extra_node_python_api"].preferences.auto_evaluate_py:
+        return None
 
+    # search for nodes all over data and update
+    for n in [n for ng in bpy.data.node_groups if ("extra_node_python_api_update_needed" in ng) for n in ng.nodes if (n.bl_idname == "GeometryNodePythonApi")]:
+        n.update()
 
-class add_depsgraph_update_post_handler_operator(bpy.types.Operator):
-    bl_idname = "mynode.add_depsgraph_update_post_handler"
-    bl_label = "add_depsgraph_update_post_handler"
-    bl_description = "add_depsgraph_update_post_handler"
-
-    def execute(self, context):
-        target_handler = BoneGeoToolkit_update_handler
-        if not (target_handler in bpy.app.handlers.depsgraph_update_post):
-            bpy.app.handlers.depsgraph_update_post.append(target_handler)
-        self.report({"INFO"}, "添加depsgraph_update_post")
-        return {"FINISHED"}
+    return None
 
 
-class remove_depsgraph_update_post_handler_operator(bpy.types.Operator):
-    bl_idname = "mynode.remove_depsgraph_update_post_handler"
-    bl_label = "remove_depsgraph_update_post_handler"
-    bl_description = "remove_depsgraph_update_post_handler"
+def all_handlers(name=False):
+    """return a list of handler stored in .blend"""
 
-    def execute(self, context):
-        target_handler = BoneGeoToolkit_update_handler
-        for handler in bpy.app.handlers.depsgraph_update_post:
-            if handler == target_handler:
-                bpy.app.handlers.depsgraph_update_post.remove(target_handler)
-                self.report({"INFO"}, "已移除depsgraph_update_post")
-            else:
-                self.report({"INFO"}, "不存在depsgraph_update_post")
-        return {"FINISHED"}
+    return_list = []
+    for oh in bpy.app.handlers:
+        try:
+            for h in oh:
+                return_list.append(h)
+        except:
+            pass
+    return return_list
 
 
-class add_frame_change_post_handler_operator(bpy.types.Operator):
-    bl_idname = "mynode.add_frame_change_post_handler"
-    bl_label = "add_frame_change_post_handler"
-    bl_description = "add_frame_change_post_handler"
+def register_handlers(status):
+    """register dispatch for handlers"""
 
-    def execute(self, context):
-        target_handler = BoneGeoToolkit_update_handler
-        if not (target_handler in bpy.app.handlers.frame_change_post):
-            bpy.app.handlers.frame_change_post.append(target_handler)
-        self.report({"INFO"}, "添加frame_change_post")
-        return {"FINISHED"}
+    if status == "register":
 
+        all_handler_names = [h.__name__ for h in all_handlers()]
 
-class remove_frame_change_post_handler_operator(bpy.types.Operator):
-    bl_idname = "mynode.remove_frame_change_post_handler"
-    bl_label = "remove_frame_change_post_handler"
-    bl_description = "remove_frame_change_post_handler"
+        # depsgraph
+        if "extra_node_python_api_depsgraph" not in all_handler_names:
+            bpy.app.handlers.depsgraph_update_post.append(extra_node_python_api_depsgraph)
 
-    def execute(self, context):
-        target_handler = BoneGeoToolkit_update_handler
-        for handler in bpy.app.handlers.frame_change_post:
-            if handler == target_handler:
-                bpy.app.handlers.frame_change_post.remove(target_handler)
-                self.report({"INFO"}, "已移除frame_change_post")
-            else:
-                self.report({"INFO"}, "不存在frame_change_post")
-        return {"FINISHED"}
+        # frame_change
+        if "extra_node_python_api_frame_pre" not in all_handler_names:
+            bpy.app.handlers.frame_change_pre.append(extra_node_python_api_frame_pre)
 
+        # render
+        # if extra_node_python_api_render_pre not in all_handlers():
+        #     bpy.app.handlers.render_pre.append(extra_node_python_api_render_pre)
+        # if extra_node_python_api_render_post not in all_handlers():
+        #     bpy.app.handlers.render_post.append(extra_node_python_api_render_post)
 
-class add_frame_change_pre_handler_operator(bpy.types.Operator):
-    bl_idname = "mynode.add_frame_change_pre_handler"
-    bl_label = "add_frame_change_pre_handler"
-    bl_description = "add_frame_change_pre_handler"
+        # blend open
+        # if extra_node_python_api_load_post not in all_handlers():
+        #     bpy.app.handlers.load_post.append(extra_node_python_api_load_post)
 
-    def execute(self, context):
-        target_handler = BoneGeoToolkit_update_handler
-        if not (target_handler in bpy.app.handlers.frame_change_pre):
-            bpy.app.handlers.frame_change_pre.append(target_handler)
-        self.report({"INFO"}, "添加frame_change_pre")
-        return {"FINISHED"}
+        return None
 
+    elif status == "unregister":
 
-class remove_frame_change_pre_handler_operator(bpy.types.Operator):
-    bl_idname = "mynode.remove_frame_change_pre_handler"
-    bl_label = "remove_frame_change_pre_handler"
-    bl_description = "remove_frame_change_pre_handler"
+        for h in all_handlers():
 
-    def execute(self, context):
-        target_handler = BoneGeoToolkit_update_handler
-        for handler in bpy.app.handlers.frame_change_pre:
-            if handler == target_handler:
-                bpy.app.handlers.frame_change_pre.remove(target_handler)
-                self.report({"INFO"}, "已移除frame_change_pre")
-            else:
-                self.report({"INFO"}, "不存在frame_change_pre")
-        return {"FINISHED"}
+            # depsgraph
+            if h.__name__ == "extra_node_python_api_depsgraph":
+                bpy.app.handlers.depsgraph_update_post.remove(h)
+
+            # frame_change
+            if h.__name__ == "extra_node_python_api_frame_pre":
+                bpy.app.handlers.frame_change_pre.remove(h)
+
+            # #render
+            # if(h==extra_node_python_api_render_pre):
+            #     bpy.app.handlers.render_pre.remove(h)
+            # if(h==extra_node_python_api_render_post):
+            #     bpy.app.handlers.render_post.remove(h)
+
+            # #blend open
+            # if(h==extra_node_python_api_load_post):
+            #     bpy.app.handlers.load_post.remove(h)
+
+    return None
 
 
-def Add_to_Node_Menu(self, context):
-    if context.area.type == "NODE_EDITOR" and context.space_data.tree_type == "GeometryNodeTree":
-        layout = self.layout
-        layout.menu("SNA_MT_GEO_NODE_test_Menu", text="Bone Tools", icon="BONE_DATA")
+##################################################
+# EXTEND MENU
+##################################################
 
 
-nodes = [
-    GeometryNodeCustom,
-    BoneGeoToolkit_update_handlers_manager,
-    test_node,
-    BoneGeoToolkit_Bone_input_node,
-    BoneGeoToolkit_BoneInfoNode,
-    BoneGeoToolkit_transform_bone_node,
-]
+# extra menu
 
 
-class SNA_MT_GEO_NODE_test_Menu(bpy.types.Menu):
-    bl_idname = "SNA_MT_GEO_NODE_test_Menu"
-    bl_label = "test_menu"
+def extra_geonode_menu(
+    self,
+    context,
+):
+    """extend NODE_MT_add with new extra menu"""
+    self.layout.menu(
+        "NODE_MT_category_GEO_EXTRA",
+        text="Extra",
+    )
+    return None
+
+
+class NODE_MT_category_GEO_EXTRA(bpy.types.Menu):
+
+    bl_idname = "NODE_MT_category_GEO_EXTRA"
+    bl_label = ""
 
     @classmethod
     def poll(cls, context):
-        return not (False)
+        return bpy.context.space_data.tree_type == "GeometryNodeTree"
 
     def draw(self, context):
-        layout = self.layout.column_flow(columns=1)
-        layout.operator_context = "INVOKE_DEFAULT"
-        for temp_node in nodes:
-            if hasattr(temp_node, "bl_icon"):
-                icon = temp_node.bl_icon
-            else:
-                icon = "BLANK1"  # 替换为默认图标名称
-            # 添加一个节点
-            node = layout.operator("node.add_node", text=temp_node.bl_label, icon=icon)
-            node.type = temp_node.bl_idname
-            node.use_transform = True
+        return None
 
 
-operators = [
-    updata_test_operator,
-    add_depsgraph_update_pre_handler_operator,
-    remove_depsgraph_update_pre_handler_operator,
-    add_depsgraph_update_post_handler_operator,
-    remove_depsgraph_update_post_handler_operator,
-    add_frame_change_post_handler_operator,
-    remove_frame_change_post_handler_operator,
-    add_frame_change_pre_handler_operator,
-    remove_frame_change_pre_handler_operator,
+# extra menu extension
+
+
+def extra_node_python_api(
+    self,
+    context,
+):
+    """extend extra menu with new node"""
+    op = self.layout.operator(
+        "node.add_node",
+        text="Python Api",
+    )
+    op.type = "GeometryNodePythonApi"
+    op.use_transform = True
+
+
+# register
+
+
+def register_menus(status):
+    """register extra menu, if not already, append item, if not already"""
+
+    if status == "register":
+
+        # register new extra menu class if not exists already, perhaps another plugin already implemented it
+        if "NODE_MT_category_GEO_EXTRA" not in bpy.types.__dir__():
+            bpy.utils.register_class(NODE_MT_category_GEO_EXTRA)
+
+        # extend add menu with extra menu if not already, _dyn_ui_initialize() will get appended drawing functions of a menu
+        add_menu = bpy.types.NODE_MT_add
+        if "extra_geonode_menu" not in [f.__name__ for f in add_menu._dyn_ui_initialize()]:
+            add_menu.append(extra_geonode_menu)
+
+        # extend extra menu with our custom nodes if not already
+        extra_menu = bpy.types.NODE_MT_category_GEO_EXTRA
+        if "extra_node_python_api" not in [f.__name__ for f in extra_menu._dyn_ui_initialize()]:
+            extra_menu.append(extra_node_python_api)
+
+        return None
+
+    elif status == "unregister":
+
+        add_menu = bpy.types.NODE_MT_add
+        extra_menu = bpy.types.NODE_MT_category_GEO_EXTRA
+
+        # remove our custom function to extra menu
+        for f in extra_menu._dyn_ui_initialize().copy():
+            if f.__name__ == "extra_node_python_api":
+                extra_menu.remove(f)
+
+        # if extra menu is empty
+        if len(extra_menu._dyn_ui_initialize()) == 1:
+
+            # remove our extra menu item draw fct add menu
+            for f in add_menu._dyn_ui_initialize().copy():
+                if f.__name__ == "extra_geonode_menu":
+                    add_menu.remove(f)
+
+            # unregister extra menu
+            bpy.utils.unregister_class(extra_menu)
+
+    return None
+
+
+##################################################
+# PROPERTIES & PREFS
+##################################################
+
+
+class EXTRANODEPYTHONAPI_AddonPref(bpy.types.AddonPreferences):
+    """addon_prefs = bpy.context.preferences.addons["extra_node_python_api"].preferences"""
+
+    bl_idname = "extra_node_python_api"
+
+    debug: bpy.props.BoolProperty(default=False)
+    auto_evaluate_py: bpy.props.BoolProperty(default=True)
+    convenience_exec1: bpy.props.StringProperty(default="rom mathutils import * ; from math import *")  # fake
+    convenience_exec2: bpy.props.StringProperty(default="D = bpy.data ; C = context = bpy.context ; scene = context.scene")  # fake
+    convenience_exec3: bpy.props.StringProperty(default="")
+
+    # drawing part in ui module
+    def draw(self, context):
+        layout = self.layout
+
+        box = layout.box()
+
+        box.prop(
+            self,
+            "auto_evaluate_py",
+            text="Auto Evaluation",
+        )
+        box.prop(
+            self,
+            "debug",
+            text="Debug Mode",
+        )
+
+        convenience = box.column(align=True)
+        convenience.label(text="Convenience Execution:")
+        cexec = convenience.row()
+        cexec.enabled = False
+        cexec.prop(
+            self,
+            "convenience_exec1",
+            text="",
+        )
+        cexec = convenience.row()
+        cexec.enabled = False
+        cexec.prop(
+            self,
+            "convenience_exec2",
+            text="",
+        )
+        cexec = convenience.row()
+        cexec.active = False
+        cexec.prop(
+            self,
+            "convenience_exec3",
+            text="",
+        )
+
+        return None
+
+
+##################################################
+# INIT REGISTRATION
+##################################################
+
+
+classes = [
+    EXTRANODEPYTHONAPI_AddonPref,
+    EXTRANODEPYTHONAPI_NG_python_api,
 ]
 
 
-# 注册函数
 def register():
-    bpy.utils.register_class(BoneGeoToolkitBoneSocket)
-    for operator in operators:
-        bpy.utils.register_class(operator)
 
-    for node in nodes:
-        bpy.utils.register_class(node)
-    # 注册自定义节点
-    bpy.utils.register_class(SNA_MT_GEO_NODE_test_Menu)
-    bpy.types.NODE_MT_add.append(Add_to_Node_Menu)
+    # classes
+    for cls in classes:
+        bpy.utils.register_class(cls)
+
+    # extend add menu
+    register_menus("register")
+
+    # handlers
+    register_handlers("register")
+
+    return None
 
 
-# 注销函数
 def unregister():
-    bpy.utils.unregister_class(BoneGeoToolkitBoneSocket)
-    for operator in operators:
-        bpy.utils.unregister_class(operator)
 
-    for node in nodes:
-        bpy.utils.unregister_class(node)
-    bpy.utils.unregister_class(SNA_MT_GEO_NODE_test_Menu)
-    bpy.types.NODE_MT_add.remove(Add_to_Node_Menu)
+    # handlers
+    register_handlers("unregister")
+
+    # extend add menu
+    register_menus("unregister")
+
+    # classes
+    for cls in reversed(classes):
+        bpy.utils.unregister_class(cls)
+
+    return None
 
 
 if __name__ == "__main__":
+    try:
+        unregister()
+    except:
+        pass
     register()
